@@ -621,6 +621,80 @@ void NVResource::free()
     IOAccelResource2::free();
 }
 
+static int gVmSticky = 1;
+static SInt64 gCntVmParked, gCntVmUnparked, gCntVmParkReleased;
+
+// VRAM recycle cache (debug.nvaccel_vm_recycle, default on).
+//
+// The compositor does not keep surface vidmem objects: every CA commit that needs a fresh layer makes the family
+// build a new NVResource + NVVidMemory and, when the layer goes away, destroy it (measured idle: ~2 alloc/free pairs
+// a second; 300+ a minute while apps open, windows drag, or the cursor updates - 64 KB to 192 KB each). Each pair
+// costs a real RM allocation and a real RM release, on the WindowServer commit thread. Sticky VRAM parks memory
+// per object, which cannot help short-lived objects: the next life gets a new object.
+//
+// Handles released here wait in a small list and are handed straight to the next allocation of the same size
+// (smallest fit), so a surface lifetime becomes a list operation. The RM allocation, its BAR1 mapping and its
+// allocation cookie all stay valid and uniquely owned while cached: this is the same hand-off NVVidMemory's own
+// park does between two lives of one object, only across objects too. Anything the list cannot take is released
+// to the framebuffer exactly as before.
+enum { kVramRecycMax = 24 };
+struct NvVramRecyc { void *handle; void *kva; unsigned long long phys; unsigned long long bytes; unsigned long long cookie; };
+static NvVramRecyc gVramRecyc[kVramRecycMax];
+static unsigned    gVramRecycN = 0;
+static IOLock     *gVramRecycLock = nullptr;
+static int         gVmRecyc = 1;
+static SInt64      gCntVmRecycPut, gCntVmRecycTake, gCntVmRecycDrop;
+
+void nvVramRecycInit()
+{
+    if (!gVramRecycLock) gVramRecycLock = IOLockAlloc();
+}
+
+// Put a released handle in the cache, or fall back to releasing it. Never called under a lock (the RM release sleeps).
+static void nvVramRecycPut(void *h, void *kva, unsigned long long phys, unsigned long long bytes, unsigned long long cookie)
+{
+    if (!h || !bytes) return;
+    bool keep = false;
+    if (gVmRecyc && gVramRecycLock) {
+        IOLockLock(gVramRecycLock);
+        if (gVramRecycN < kVramRecycMax) {
+            NvVramRecyc &e = gVramRecyc[gVramRecycN++];
+            e.handle = h; e.kva = kva; e.phys = phys; e.bytes = bytes; e.cookie = cookie;
+            keep = true;
+        }
+        IOLockUnlock(gVramRecycLock);
+    }
+    if (keep) {
+        OSAddAtomic64(1, &gCntVmRecycPut);
+        return;
+    }
+    OSAddAtomic64(1, &gCntVmRecycDrop);
+    struct NVRMVramRequest r;
+    for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
+    r.version = NVRM_VRAM_ABI_VERSION;
+    r.handle = h; r.kva = kva; r.actualSize = bytes; r.allocationCookie = cookie;
+    if (NVAccel::gAccel) NVAccel::gAccel->askFramebufferForVram(&r, false);
+}
+
+// Take the smallest cached handle that covers want, or fail (the caller then asks the framebuffer).
+static bool nvVramRecycTake(unsigned long long want, void **h, void **kva, unsigned long long *phys, unsigned long long *bytes, unsigned long long *cookie)
+{
+    if (!gVmRecyc || !want || !gVramRecycLock) return false;
+    bool got = false;
+    IOLockLock(gVramRecycLock);
+    int best = -1;
+    for (unsigned i = 0; i < gVramRecycN; i++)
+        if (gVramRecyc[i].bytes >= want && (best < 0 || gVramRecyc[i].bytes < gVramRecyc[best].bytes)) best = (int)i;
+    if (best >= 0) {
+        NvVramRecyc e = gVramRecyc[best];
+        gVramRecyc[best] = gVramRecyc[--gVramRecycN];
+        *h = e.handle; *kva = e.kva; *phys = e.phys; *bytes = e.bytes; *cookie = e.cookie;
+        got = true;
+    }
+    IOLockUnlock(gVramRecycLock);
+    return got;   // gCntVmRecycTake is incremented by the caller that logs the reuse
+}
+
 bool NVVidMemory::allocPhysical()
 {
     if (fScanout) {
@@ -638,6 +712,29 @@ bool NVVidMemory::allocPhysical()
     const unsigned long long want = *(const volatile unsigned long long *)((const unsigned char *)this + 0x40);
     if (!want) { ALOG("NVVidMemory::allocPhysical(%p): length at +0x40 is 0 -- nothing to back", this); return false; }
     if (!NVAccel::gAccel) { ALOG("NVVidMemory::allocPhysical(%p): no accelerator", this); return false; }
+    if (fParkHandle) {
+        if (fParkBytes >= want) {
+            fRmHandle = fParkHandle; fKva = fParkKva; fPhys = fParkPhys; fBytes = fParkBytes; fAllocationCookie = fParkCookie;
+            fParkHandle = nullptr; fParkKva = nullptr; fParkPhys = fParkBytes = fParkCookie = 0;
+            *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
+            const SInt64 n = OSAddAtomic64(1, &gCntVmUnparked);
+            if (n < 8 || (n & 1023) == 0)
+                ALOG("NVVidMemory::allocPhysical(%p): the same VRAM again -- phys 0x%llx (%llu bytes, reused %lld)", this, fPhys, fBytes, (long long)n + 1);
+            return true;
+        }
+        releaseParked();   // the resource grew: its old VRAM cannot hold it
+    } else {
+        void *rh = nullptr, *rk = nullptr; unsigned long long rp = 0, rb = 0, rc = 0;
+        if (nvVramRecycTake(want, &rh, &rk, &rp, &rb, &rc)) {
+            fRmHandle = rh; fKva = rk; fPhys = rp; fBytes = rb; fAllocationCookie = rc;
+            *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
+            OSAddAtomic64(1, &gCntVmAlloc); OSAddAtomic64((SInt64)fBytes, &gCntVmAllocBytes);
+            const SInt64 n = OSAddAtomic64(1, &gCntVmRecycTake);   // also the log cadence for the line below
+            if (n < 8 || (n % 512) == 0)
+                ALOG("NVVidMemory::allocPhysical(%p): %llu bytes of RECYCLED VRAM -- phys 0x%llx kva %p (cached %lld)", this, fBytes, fPhys, fKva, (long long)n + 1);
+            return true;
+        }
+    }
 
     struct NVRMVramRequest r;
     for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
@@ -668,13 +765,36 @@ void NVVidMemory::deallocPhysical()
     }
     if (!fRmHandle) return;
     OSAddAtomic64(1, &gCntVmDealloc); OSAddAtomic64((SInt64)fBytes, &gCntVmDeallocBytes);
-    struct NVRMVramRequest r;
-    for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
-    r.version = NVRM_VRAM_ABI_VERSION;
-    r.handle = fRmHandle; r.kva = fKva; r.actualSize = fBytes; r.allocationCookie = fAllocationCookie;
-    if (NVAccel::gAccel) NVAccel::gAccel->askFramebufferForVram(&r, false);
+    // The family frees a surface's VRAM after copying it back for the CPU and backs the surface with new VRAM when the
+    // GPU needs it again. The Metal plugin imported the old VRAM once and goes on drawing into it, so from then on the
+    // display and every copy-back read new, never-written VRAM: black frames, and windows black until a drag made
+    // WindowServer import again (10-10, RTX 3070: VRAM 0x00000000 on every frame after a page-off, the plugin still
+    // marking the surface drawn). Parked instead, this VRAM is what the next allocPhysical hands back, so the surface
+    // keeps the memory the plugin draws into; it is released when the resource goes away (free) or outgrows it.
+    if (gVmSticky) {
+        if (fParkHandle) releaseParked();
+        fParkHandle = fRmHandle; fParkKva = fKva; fParkPhys = fPhys; fParkBytes = fBytes; fParkCookie = fAllocationCookie;
+        fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
+        *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
+        OSAddAtomic64(1, &gCntVmParked);
+        return;
+    }
+    nvVramRecycPut(fRmHandle, fKva, fPhys, fBytes, fAllocationCookie);
     fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
     *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
+}
+void NVVidMemory::releaseParked()
+{
+    if (!fParkHandle) return;
+    nvVramRecycPut(fParkHandle, fParkKva, fParkPhys, fParkBytes, fParkCookie);
+    fParkHandle = nullptr; fParkKva = nullptr; fParkPhys = fParkBytes = fParkCookie = 0;
+    OSAddAtomic64(1, &gCntVmParkReleased);
+}
+void NVVidMemory::free()
+{
+    if (fRmHandle && !fScanout) { const int sticky = gVmSticky; gVmSticky = 0; deallocPhysical(); gVmSticky = sticky; }
+    releaseParked();
+    IOAccelVidMemory::free();
 }
 
 class IOSurface {
@@ -745,9 +865,26 @@ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
     return gNvIop != 0 && !nvAccelIopAsyncBusy(this);
 }
 
-static void nvAccelSurfScanoutSync(IOSurface *s);
+static bool nvAccelSurfScanoutSync(IOSurface *s);
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
 static void nvAccelIopHome(IOService *fb, unsigned head);
+static SInt64 gCntIopStaleDrop, gCntIopLockWaits, gCntIopLockMisses;
+// NVACCEL_LEAN: the production build. Everything below (VRAM sampling on and around the flip, cache
+// re-resolution, dense comparisons) only ever read pixels off PCIe to answer diagnosis questions, and it ran on
+// the WindowServer commit thread: 64 uncached BAR1 reads per presented frame plus, every 250 ms, a 1024-sample
+// double probe over an IOSurface map. The build compiles it out entirely (build/accel_build_local.sh passes
+// ACCELDEFS=-DNVACCEL_LEAN=1); the knob sysctls and the counters do not exist either.
+#ifndef NVACCEL_LEAN
+static SInt64 gCntIopFlipProbed, gCntIopFlipBlank, gCntIopFlipVerified, gCntIopFlipCacheStale;
+static int gIopFlipProbe = 1, gIopFlipVerify = 1;
+static SInt64 gCntIopFrontProbed, gCntIopFrontChanged, gCntIopFrontBlank;
+static int gIopCompleteDelayUs = 0;
+static SInt64 gCntIopSysProbed, gCntIopSysNewer;
+#else
+enum : int { gIopFlipProbe = 0, gIopFlipVerify = 0, gIopCompleteDelayUs = 0 };
+#endif
+static int gPageoffPendingOnly = 1;
+static SInt64 gCntPageoffSkipped;
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     if (!gNvIop) return (IOReturn)0xe00002c7;
@@ -788,7 +925,16 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
         return kIOReturnSuccess;
     } else if (s) {
-        nvAccelSurfScanoutSync(s);
+        // A frame whose newest pixels are still only in VRAM is never copied from system memory: that copy put a black
+        // (or an older) frame on the panel every time the copy back missed the lock - the black/picture/black strobe.
+        // Leaving the previous frame up costs one frame; the next transaction brings the panel current.
+        if (!nvAccelSurfScanoutSync(s)) {
+            const SInt64 d = OSAddAtomic64(1, &gCntIopStaleDrop);
+            if (d < 4 || (d & 1023) == 0)
+                ALOG("iop: surface 0x%x is newest in VRAM and could not be copied back -- previous frame kept on head %u (stale drops %lld)",
+                     s->getSurfaceID(), head, (long long)d + 1);
+            return kIOReturnSuccess;
+        }
         const unsigned fmt = s->getPixelFormat();
         if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
         const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
@@ -905,9 +1051,40 @@ NVACCEL_CNT(nvaccel_iop_empty,        gCntIopEmpty,       "K3: transactions with
 NVACCEL_CNT(nvaccel_iop_src_res,      gCntIopSrcRes,      "K3: frames sourced from our VRAM resource");
 NVACCEL_CNT(nvaccel_iop_src_surf,     gCntIopSrcSurf,     "K3: frames sourced from the IOSurface memory");
 NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
+// Zero-copy scan-out from the first frame (nvaccelInstallSysctl; -nvrmnoflip keeps the copy). WAS: off until NVRM wrote 1
+// 60 s after the display armed, and that first minute ran on the copy path, which strobed black at high refresh rates.
 static int    gIopFlip = 0;
 static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopFlip, 0, "1 = scan the composited IOSurface out of its own VRAM (no copy)");
+NVACCEL_CNT(nvaccel_iop_stale_drop,  gCntIopStaleDrop,  "frames newest in VRAM that could not be copied back: previous frame kept instead of a stale copy");
+NVACCEL_CNT(nvaccel_iop_lock_waits,  gCntIopLockWaits,  "display-path accelerator lock taken after a bounded retry");
+NVACCEL_CNT(nvaccel_iop_lock_misses, gCntIopLockMisses, "display-path accelerator lock still busy after the bounded retry");
+#ifndef NVACCEL_LEAN
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip_probe, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopFlipProbe, 0, "1 = sample each zero-copy frame's VRAM before it is scanned out");
+NVACCEL_CNT(nvaccel_iop_flip_probed, gCntIopFlipProbed, "zero-copy frames whose VRAM was sampled");
+NVACCEL_CNT(nvaccel_iop_flip_blank,  gCntIopFlipBlank,  "sampled zero-copy frames whose 64 VRAM samples were all one colour");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip_verify, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopFlipVerify, 0, "1 = re-resolve a cached surface's VRAM whenever the lock is free");
+NVACCEL_CNT(nvaccel_iop_flip_verified,    gCntIopFlipVerified,   "cache hits re-resolved under a free lock");
+NVACCEL_CNT(nvaccel_iop_flip_cache_stale, gCntIopFlipCacheStale, "cache hits whose surface had other VRAM by then (the fresh one was flipped)");
+NVACCEL_CNT(nvaccel_iop_front_probed,  gCntIopFrontProbed,  "on-panel surfaces sampled again right before the next flip");
+NVACCEL_CNT(nvaccel_iop_front_changed, gCntIopFrontChanged, "on-panel surfaces whose VRAM changed while they were being scanned out");
+NVACCEL_CNT(nvaccel_iop_front_blank,   gCntIopFrontBlank,   "on-panel surfaces that read blank right before the next flip");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_complete_delay_us, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopCompleteDelayUs, 0, "diagnostic: hold each zero-copy transaction's completion this long after the flip latched");
+#endif
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_pageoff_pending_only, CTLFLAG_RW | CTLFLAG_LOCKED, &gPageoffPendingOnly, 0, "1 = copy a surface's VRAM back to system memory only if the GPU wrote it since the last sync");
+NVACCEL_CNT(nvaccel_pageoff_skipped, gCntPageoffSkipped, "page-offs skipped: the surface's system memory was already its newest copy");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_vm_sticky, CTLFLAG_RW | CTLFLAG_LOCKED, &gVmSticky, 0, "1 = a surface keeps its VRAM across the family's dealloc/alloc (the memory the plugin draws into)");
+NVACCEL_CNT(nvaccel_vm_parked,        gCntVmParked,       "VRAM kept when the family freed a surface's VRAM");
+NVACCEL_CNT(nvaccel_vm_unparked,      gCntVmUnparked,     "allocations answered with the surface's kept VRAM");
+NVACCEL_CNT(nvaccel_vm_park_released, gCntVmParkReleased, "kept VRAM released (resource freed or grown)");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_vm_recycle, CTLFLAG_RW | CTLFLAG_LOCKED, &gVmRecyc, 0, "1 = released RM VRAM waits in a small list and is handed to the next surface of the same size (no RM alloc/free per short-lived surface)");
+NVACCEL_CNT(nvaccel_vm_recyc_put,   gCntVmRecycPut,   "released RM handles kept for reuse");
+NVACCEL_CNT(nvaccel_vm_recyc_take,  gCntVmRecycTake,  "allocations served from the recycle list");
+NVACCEL_CNT(nvaccel_vm_recyc_drop,  gCntVmRecycDrop,  "releases the list could not take (RM-released instead)");
+#ifndef NVACCEL_LEAN
+NVACCEL_CNT(nvaccel_iop_sys_probed,  gCntIopSysProbed,  "dense VRAM/system-memory comparisons of a frame about to be scanned out");
+NVACCEL_CNT(nvaccel_iop_sys_newer,   gCntIopSysNewer,   "compared frames whose system memory had the picture while VRAM did not");
+#endif
 NVACCEL_CNT(nvaccel_iop_flips,        gCntIopFlip,        "frames scanned out of the surface's own VRAM (zero copy)");
 NVACCEL_CNT(nvaccel_iop_flip_home,    gCntIopFlipHome,    "flips back to the boot scanout before a copied frame");
 NVACCEL_CNT(nvaccel_iop_flip_lock,    gCntIopFlipNo[3],   "copied because the accelerator lock was busy");
@@ -932,6 +1109,7 @@ static bool gSysctlInstalled = false;
 static void nvaccelInstallSysctl(void)
 {
     if (gSysctlInstalled) return;
+    nvVramRecycInit();
     sysctl_register_oid(&sysctl__debug_nvaccelfb);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc);       sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc_bytes);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc);     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc_bytes);
@@ -956,6 +1134,27 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h2);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h3);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_stale_drop);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_lock_waits); sysctl_register_oid(&sysctl__debug_nvaccel_iop_lock_misses);
+#ifndef NVACCEL_LEAN
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_probe);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_probed); sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_blank);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_verify);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_verified); sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_cache_stale);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_front_probed); sysctl_register_oid(&sysctl__debug_nvaccel_iop_front_changed);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_front_blank);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_complete_delay_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_sys_probed);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_sys_newer);
+#endif
+    sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_pending_only); sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_skipped);
+    sysctl_register_oid(&sysctl__debug_nvaccel_vm_sticky); sysctl_register_oid(&sysctl__debug_nvaccel_vm_parked);
+    sysctl_register_oid(&sysctl__debug_nvaccel_vm_unparked); sysctl_register_oid(&sysctl__debug_nvaccel_vm_park_released);
+    sysctl_register_oid(&sysctl__debug_nvaccel_vm_recycle);
+    sysctl_register_oid(&sysctl__debug_nvaccel_vm_recyc_put); sysctl_register_oid(&sysctl__debug_nvaccel_vm_recyc_take);
+    sysctl_register_oid(&sysctl__debug_nvaccel_vm_recyc_drop);
+    { char nb[8] = { 0 }; gIopFlip = PE_parse_boot_argn("-nvrmnoflip", nb, sizeof nb) ? 0 : 1; }
+    ALOG("iop: zero-copy scan-out %s from the first frame", gIopFlip ? "ON" : "OFF (-nvrmnoflip: every frame is copied)");
     gSysctlInstalled = true;
     ALOG("sysctl debug.nvaccelfb installed -- `sudo sysctl -w debug.nvaccelfb=1` registers the framebuffer");
 }
@@ -1060,6 +1259,20 @@ static void nvFamUnlock(NVAccel *a)
     a->acceleratorWillUnlock("", 0);
     _ZN22IOGraphicsAccelerator211unlock_busyEv(a);
     IOLockUnlock(*(IOLock *volatile *)((unsigned char *)a + 0x88));
+}
+// The display path must not block on the accelerator lock (the thread holding it can be waiting for this transaction),
+// and a single try failed on every other frame at 240 Hz: the compositor's next dirty escape holds the lock while the
+// previous frame is presented (10-10, RTX 3070: "accelerator lock busy" alternating with good frames, 40 ms apart).
+// Retry for a bounded time instead; a miss after that is reported, never waited out.
+static bool nvFamLockBounded(NVAccel *a, unsigned ms)
+{
+    if (nvFamLock(a, true)) return true;
+    for (unsigned i = 0; i < ms; i++) {
+        IOSleep(1);
+        if (nvFamLock(a, true)) { OSAddAtomic64(1, &gCntIopLockWaits); return true; }
+    }
+    OSAddAtomic64(1, &gCntIopLockMisses);
+    return false;
 }
 static unsigned gNVSVLockMiss;
 enum { kNVSVPend = 512 };
@@ -1195,6 +1408,20 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
         IOAccelResource2::pageoff(ev, a1, out, a3);
         return;
     }
+    // The plugin marks every GPU write into a surface's VRAM (surface dirty -> pending). A surface that is not pending
+    // has nothing newer in VRAM than in system memory: it was last drawn by the CPU, or already copied back. Copying
+    // VRAM over it anyway replaced CPU drawing with stale or never-written VRAM - windows that stay black until a drag
+    // makes the app redraw everything. (debug.nvaccel_pageoff_pending_only=0 restores the unconditional copy.)
+    if (gPageoffPendingOnly && !nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(surf), 2)) {
+        const SInt64 n = OSAddAtomic64(1, &gCntPageoffSkipped);
+        if (n < 6 || (n & 4095) == 0)
+            ALOG("surfvram pageoff: surface %u not written by the GPU since its last sync -- system memory kept (skipped %lld)",
+                 _ZNK9IOSurface12getSurfaceIDEv(surf), (long long)n + 1);
+        volatile unsigned short *valid = *(unsigned short *volatile *)(r + 0x30);
+        if (valid) valid[0] |= 1;
+        if (out) *out = true;
+        return;
+    }
     IOMemoryDescriptor *md = (IOMemoryDescriptor *)_ZNK9IOSurface19getMemoryDescriptorEv(surf);
     if (!md || md->prepare(kIODirectionNone) != kIOReturnSuccess) {
         gNVSVPageoffFail++;
@@ -1271,9 +1498,12 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
         gNVSVPageoff++;
     } else gNVSVPageoffFail++;
     if (out) *out = ok;
-    if (gNVSVPageoff + gNVSVPageoffFail <= 8 || ((gNVSVPageoff + gNVSVPageoffFail) & 1023) == 0)
-        ALOG("surfvram pageoff: res %p %llu B on the copy engine -> %#x in %llu us%s + cpu %llu us (ok %u, failed %u, staged %u)",
-             this, len, st, usec, staged ? " (staged)" : " (per page)", cpuUs, gNVSVPageoff, gNVSVPageoffFail, gNVSVStaged);
+    // Denser cadence than the other logs: the sizes and ids here are the evidence for which surface lifetimes the
+    // compositor is running (a 8 MB one is the scanout surface; 16-64 KB ones are cursor and layer updates), and every
+    // line is the CPU and copy-engine cost of those lifetimes.
+    if (gNVSVPageoff + gNVSVPageoffFail <= 24 || ((gNVSVPageoff + gNVSVPageoffFail) & 127) == 0)
+        ALOG("surfvram pageoff: res %p surface 0x%x %llu B on the copy engine -> %#x in %llu us%s + cpu %llu us (ok %u, failed %u, staged %u)",
+             this, surf ? (unsigned)_ZNK9IOSurface12getSurfaceIDEv(surf) : 0u, len, st, usec, staged ? " (staged)" : " (per page)", cpuUs, gNVSVPageoff, gNVSVPageoffFail, gNVSVStaged);
 }
 
 static IOSurface *gIopFlipFront[kNvMaxFB], *gIopFlipPrev[kNvMaxFB];
@@ -1281,7 +1511,11 @@ static bool gIopFlipped[kNvMaxFB];
 static unsigned gIopFlipLogs;
 static bool nvAccelIopFlipNo(int why) { OSAddAtomic64(1, &gCntIopFlipNo[why & 7]); return false; }
 struct NVIopFlipCache { IOSurface *s; NVResource *res; NVVidMemory *vm; void *kmem; unsigned long long bytes; unsigned long long use; };
-static NVIopFlipCache gIopFlipCache[8];
+// Each head's compositor cycles through ~3 swap surfaces; 8 entries thrashed from the third head on, and every miss needs
+// the accelerator lock. Not more: an entry keeps its surface (and that surface's BAR1 mapping) alive until it ages out,
+// and with a 256 MB BAR1 the whole surface budget is 192 MB.
+enum { kIopFlipCacheN = 12 };
+static NVIopFlipCache gIopFlipCache[kIopFlipCacheN];
 static IOSimpleLock *gIopFlipCacheLock;
 static unsigned long long gIopFlipCacheTick;
 static bool nvAccelIopCacheGet(IOSurface *s, NVResource **res, NVVidMemory **vm, void **kmem, unsigned long long *bytes)
@@ -1289,7 +1523,7 @@ static bool nvAccelIopCacheGet(IOSurface *s, NVResource **res, NVVidMemory **vm,
     if (!gIopFlipCacheLock) return false;
     bool hit = false;
     IOSimpleLockLock(gIopFlipCacheLock);
-    for (unsigned i = 0; i < 8; i++) if (gIopFlipCache[i].s == s) {
+    for (unsigned i = 0; i < kIopFlipCacheN; i++) if (gIopFlipCache[i].s == s) {
         NVVidMemory *v = gIopFlipCache[i].vm;
         if (v && v->fRmHandle == gIopFlipCache[i].kmem && v->fBytes == gIopFlipCache[i].bytes) {
             *res = gIopFlipCache[i].res; *vm = v; *kmem = gIopFlipCache[i].kmem; *bytes = gIopFlipCache[i].bytes;
@@ -1300,24 +1534,34 @@ static bool nvAccelIopCacheGet(IOSurface *s, NVResource **res, NVVidMemory **vm,
     IOSimpleLockUnlock(gIopFlipCacheLock);
     return hit;
 }
-static void nvAccelIopCachePut(IOSurface *s, NVResource *res, NVVidMemory *vm, void *kmem, unsigned long long bytes)
+// Returns the surface the entry displaced, still retained: the caller releases it outside the accelerator lock (the
+// last release frees the surface's device caches, which take that lock).
+static IOSurface *nvAccelIopCacheStore(IOSurface *s, NVResource *res, NVVidMemory *vm, void *kmem, unsigned long long bytes)
 {
     if (!gIopFlipCacheLock) { IOSimpleLock *l = IOSimpleLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gIopFlipCacheLock)) IOSimpleLockFree(l); }
-    if (!gIopFlipCacheLock) return;
-    IOSurface *drop = nullptr;
+    if (!gIopFlipCacheLock || !s) return nullptr;
     ((OSObject *)s)->retain();
     IOSimpleLockLock(gIopFlipCacheLock);
-    unsigned k = 0;
-    for (unsigned i = 0; i < 8; i++) {
-        if (gIopFlipCache[i].s == s) { k = i; break; }
-        if (!gIopFlipCache[i].s) { k = i; break; }
-        if (gIopFlipCache[i].use < gIopFlipCache[k].use) k = i;
+    // The surface's own entry first: taking the first free slot ahead of it left a second, older entry for the same
+    // surface that held a reference until it aged out.
+    unsigned k = kIopFlipCacheN;
+    for (unsigned i = 0; i < kIopFlipCacheN && k == kIopFlipCacheN; i++) if (gIopFlipCache[i].s == s) k = i;
+    if (k == kIopFlipCacheN) {
+        k = 0;
+        for (unsigned i = 0; i < kIopFlipCacheN; i++) {
+            if (!gIopFlipCache[i].s) { k = i; break; }
+            if (gIopFlipCache[i].use < gIopFlipCache[k].use) k = i;
+        }
     }
-    drop = gIopFlipCache[k].s;
+    IOSurface *drop = gIopFlipCache[k].s;
     gIopFlipCache[k].s = s; gIopFlipCache[k].res = res; gIopFlipCache[k].vm = vm; gIopFlipCache[k].kmem = kmem;
     gIopFlipCache[k].bytes = bytes; gIopFlipCache[k].use = ++gIopFlipCacheTick;
     IOSimpleLockUnlock(gIopFlipCacheLock);
-    if (drop) ((OSObject *)drop)->release();
+    return drop;
+}
+static void nvAccelIopCachePut(IOSurface *s, NVResource *res, NVVidMemory *vm, void *kmem, unsigned long long bytes)
+{
+    if (IOSurface *drop = nvAccelIopCacheStore(s, res, vm, kmem, bytes)) ((OSObject *)drop)->release();
 }
 extern "C" {
 void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *pipe, void *arg);
@@ -1325,6 +1569,36 @@ struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *par
 int thread_call_enter(struct thread_call *call);
 }
 struct NVIopAsync { void *pipe; IOService *fb; IOSurface *s; struct NVRMFlipRequest f; volatile SInt32 busy; struct thread_call *call; };
+#ifndef NVACCEL_LEAN
+// Diagnostic: 64 samples (8x8 grid) of a surface's VRAM through its kernel BAR1 mapping, with a checksum.
+struct NVVramSample { unsigned nz, varied, first, mid, sum; bool ok; };
+static NVVramSample nvAccelSampleSurfaceVram(IOSurface *s)
+{
+    NVVramSample r = {};
+    NVResource *res = nullptr; NVVidMemory *vm = nullptr; void *kmem = nullptr; unsigned long long bytes = 0;
+    if (!s || !nvAccelIopCacheGet(s, &res, &vm, &kmem, &bytes) || !vm->fKva) return r;
+    const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
+    if (!W || !H || P < 4 * W || H * P > bytes) return r;
+    const volatile unsigned int *px = (const volatile unsigned int *)vm->fKva;
+    const unsigned ppr = (unsigned)(P / 4); r.first = px[0] & 0xffffffu;
+    for (unsigned i = 0; i < 8; i++) for (unsigned j = 0; j < 8; j++) {
+        const unsigned v = px[(unsigned long)((H * (2 * i + 1)) / 16) * ppr + (unsigned)((W * (2 * j + 1)) / 16)] & 0xffffffu;
+        if (v) r.nz++;
+        if (v != r.first) r.varied++;
+        if (i == 4 && j == 4) r.mid = v;
+        r.sum = r.sum * 33u + v;
+    }
+    r.ok = true;
+    return r;
+}
+#endif
+// Diagnostic: is the surface on the panel changed (drawn into) before the next frame replaces it? The surface's samples
+// are taken right after its flip latched and again right before the next flip; a difference means something drew into
+// the surface the display was scanning out.
+#ifndef NVACCEL_LEAN
+static unsigned gIopFrontSum[kNvMaxFB]; static IOSurface *gIopFrontSumSurf[kNvMaxFB];
+#endif
+
 static NVIopAsync gIopAs[kNvMaxFB];
 static SInt32 gIopAsyncRefuseRun;
 static bool nvAccelIopAsyncBusy(const void *pipe)
@@ -1338,6 +1612,21 @@ static void nvAccelIopAsyncRun(void *p0, void *)
     NVIopAsync *e = (NVIopAsync *)p0;
     const unsigned head = (unsigned)(e - gIopAs);
     IOSurface *s = e->s; e->s = nullptr;
+#ifndef NVACCEL_LEAN
+    if (gIopFlipProbe && gIopFlipFront[head] && gIopFlipFront[head] == gIopFrontSumSurf[head] && gIopFlipFront[head] != s) {
+        const NVVramSample f = nvAccelSampleSurfaceVram(gIopFlipFront[head]);
+        if (f.ok) {
+            const SInt64 n = OSAddAtomic64(1, &gCntIopFrontProbed);
+            const bool changed = f.sum != gIopFrontSum[head];
+            if (changed) OSAddAtomic64(1, &gCntIopFrontChanged);
+            if (!f.varied) OSAddAtomic64(1, &gCntIopFrontBlank);
+            if (n < 8 || (changed && gCntIopFrontChanged < 16) || (n % 480) == 0)
+                ALOG("iop: front probe #%lld head %u surface 0x%x while on the panel: %s, nonzero %u varied %u mid 0x%06x (changed %lld, blank %lld)",
+                     (long long)n + 1, head, gIopFlipFront[head]->getSurfaceID(), changed ? "CHANGED since its flip" : "unchanged",
+                     f.nz, f.varied, f.mid, (long long)gCntIopFrontChanged, (long long)gCntIopFrontBlank);
+        }
+    }
+#endif
     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
     IOReturn rr = sym ? e->fb->callPlatformFunction(sym, false, &e->f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
     if (sym) sym->release();
@@ -1345,6 +1634,11 @@ static void nvAccelIopAsyncRun(void *p0, void *)
         gIopAsyncRefuseRun = 0;
         if (gIopFlipPrev[head]) ((OSObject *)gIopFlipPrev[head])->release();
         gIopFlipPrev[head] = gIopFlipFront[head]; gIopFlipFront[head] = s; gIopFlipped[head] = true;
+#ifndef NVACCEL_LEAN
+        if (gIopFlipProbe) { const NVVramSample f = nvAccelSampleSurfaceVram(s); gIopFrontSumSurf[head] = f.ok ? s : nullptr; gIopFrontSum[head] = f.sum; }
+        // Diagnostic knob: hold the transaction's completion (WindowServer reuses the surface this one replaced) a while.
+        if (gIopCompleteDelayUs > 0) IOSleep((unsigned)((gIopCompleteDelayUs + 999) / 1000));
+#endif
         const SInt64 n = OSAddAtomic64(1, &gCntIopFlip); OSAddAtomic64(1, &gCntIopAsync);
         if (n < 4 || n == 600 || (n & 0xffff) == 0)
             ALOG("iop: ASYNC swap #%lld head %u: surface 0x%x %ux%u pitch %u scanned out of its own VRAM (flipResult %d)",
@@ -1386,10 +1680,35 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     if (!a) return nvAccelIopFlipNo(1);
     if (s->getPixelFormat() != 0x42475241u) return nvAccelIopFlipNo(2);
     NVResource *res = nullptr; NVVidMemory *vm = nullptr; void *kmem = nullptr; unsigned long long bytes = 0;
-    if (nvAccelIopCacheGet(s, &res, &vm, &kmem, &bytes)) {
+    bool hit = nvAccelIopCacheGet(s, &res, &vm, &kmem, &bytes);
+    // An entry only proves its vidmem object still has the handle it had; the surface itself may be backed by other VRAM
+    // by now (the 192 MB budget of a 256 MB BAR1 evicts and re-backs surfaces all the time), and then the flip scans out
+    // memory nobody draws into. Whenever the lock is free, the surface's current VRAM is resolved again and wins.
+#ifndef NVACCEL_LEAN
+    if (hit && gIopFlipVerify && nvFamLock(a, true)) {
+        void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
+        OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
+        NVResource *r2 = OSDynamicCast(NVResource, ctx);
+        NVVidMemory *v2 = r2 ? nvres_vidmem(r2) : nullptr;
+        void *k2 = (v2 && v2->fRmHandle && v2->fBytes && !v2->fScanout) ? v2->fRmHandle : nullptr;
+        const unsigned long long b2 = v2 ? v2->fBytes : 0;
+        if (cache) ((OSObject *)cache)->release();
+        nvFamUnlock(a);
+        OSAddAtomic64(1, &gCntIopFlipVerified);
+        if (k2 != kmem || r2 != res || v2 != vm) {
+            const SInt64 n = OSAddAtomic64(1, &gCntIopFlipCacheStale);
+            if (n < 8 || (n % 256) == 0)
+                ALOG("iop: flip cache STALE for surface 0x%x: cached res %p vm %p mem %p, current res %p vm %p mem %p (stale %lld)",
+                     s->getSurfaceID(), res, vm, kmem, r2, v2, k2, (long long)n + 1);
+            res = r2; vm = v2; kmem = k2; bytes = b2;
+            if (kmem) nvAccelIopCachePut(s, res, vm, kmem, bytes);
+        }
+    }
+#endif
+    if (hit) {
         OSAddAtomic64(1, &gCntIopFlipHit);
     } else {
-        if (!nvFamLock(a, true)) return nvAccelIopFlipNo(3);
+        if (!nvFamLockBounded(a, 4)) return nvAccelIopFlipNo(3);
         void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
         OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
         res = OSDynamicCast(NVResource, ctx);
@@ -1407,6 +1726,58 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     if (!vramNewest) return nvAccelIopFlipNo(5);
     const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
     if (!W || !H || P < 4 * W || H * P > bytes) return nvAccelIopFlipNo(6);
+    // Diagnostic (debug.nvaccel_iop_flip_probe): what the frame about to be scanned out holds in VRAM, read through the
+    // surface's own kernel BAR1 mapping - 64 samples on an 8x8 grid. A surface WindowServer composited into reads varied.
+    // Every 250 ms a denser look (32x32 grid, alpha kept) at VRAM and at the surface's system memory side by side:
+    // "never written" VRAM reads 0x00000000, a compositor's black clear reads 0xff000000.
+#ifndef NVACCEL_LEAN
+    if (gIopFlipProbe && vm->fKva) {
+        const volatile unsigned int *px = (const volatile unsigned int *)vm->fKva;
+        const unsigned ppr = (unsigned)(P / 4); const unsigned first = px[0] & 0xffffffu;
+        unsigned nz = 0, varied = 0, mid = 0;
+        for (unsigned i = 0; i < 8; i++) for (unsigned j = 0; j < 8; j++) {
+            const unsigned v = px[(unsigned long)((H * (2 * i + 1)) / 16) * ppr + (unsigned)((W * (2 * j + 1)) / 16)] & 0xffffffu;
+            if (v) nz++;
+            if (v != first) varied++;
+            if (i == 4 && j == 4) mid = v;
+        }
+        const SInt64 n = OSAddAtomic64(1, &gCntIopFlipProbed);
+        if (!varied) OSAddAtomic64(1, &gCntIopFlipBlank);
+        if (n < 12 || (n % 240) == 0)
+            ALOG("iop: probe #%lld surface 0x%x %llux%llu pitch %llu VRAM phys 0x%llx: nonzero %u varied %u first 0x%06x mid 0x%06x (blank so far %lld)",
+                 (long long)n + 1, s->getSurfaceID(), W, H, P, vm->fPhys, nz, varied, first, mid, (long long)gCntIopFlipBlank);
+        static uint64_t sLastDense;
+        const uint64_t now = mach_absolute_time(); uint64_t gap = 0; absolutetime_to_nanoseconds(now - sLastDense, &gap);
+        if (gap > 250000000ull) {
+            sLastDense = now;
+            unsigned vz = 0, vb = 0, vc = 0, sz = 0, sb = 0, sc = 0, bar = 0, sameRgb = 0; bool sysOk = false;
+            IOMemoryDescriptor *md = s->getMemoryDescriptor();
+            IOMemoryMap *mm = nullptr;
+            if (md && md->getLength() >= H * P && md->prepare() == kIOReturnSuccess) {
+                mm = md->map(kIOMapReadOnly);
+                if (!mm) md->complete();
+            }
+            const volatile unsigned int *sp = mm ? (const volatile unsigned int *)mm->getVirtualAddress() : nullptr;
+            for (unsigned i = 0; i < 32; i++) for (unsigned j = 0; j < 32; j++) {
+                const unsigned long off = (unsigned long)((H * (2 * i + 1)) / 64) * ppr + (unsigned)((W * (2 * j + 1)) / 64);
+                const unsigned v = px[off];
+                if (!v) vz++; else if (!(v & 0xffffffu)) vb++; else vc++;
+                if (sp) { const unsigned w = sp[off]; if (!w) sz++; else if (!(w & 0xffffffu)) sb++; else sc++;
+                          if ((w & 0xffffffu) == (v & 0xffffffu)) sameRgb++; }
+            }
+            for (unsigned x = 0; x < W; x += 8) if (px[8 * ppr + x] & 0xffffffu) bar++;
+            if (sp) { sysOk = true; mm->release(); md->complete(); }
+            const unsigned id = s->getSurfaceID();
+            volatile unsigned short *vb2 = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
+            const SInt64 d = OSAddAtomic64(1, &gCntIopSysProbed);
+            if (sysOk && vc < 64 && sc > 512) OSAddAtomic64(1, &gCntIopSysNewer);
+            if (d < 40 || (d % 40) == 0 || (sysOk && vc < 64 && sc > 512 && gCntIopSysNewer < 40))
+                ALOG("iop: dense #%lld surface 0x%x | VRAM zero %u black %u colour %u, menubar %u/%u | sysmem %s zero %u black %u colour %u, same %u/1024 | pending %d valid0 0x%x valid6 0x%x",
+                     (long long)d + 1, id, vz, vb, vc, bar, (unsigned)(W / 8), sysOk ? "" : "(unmapped)", sz, sb, sc, sameRgb,
+                     (int)nvSVPend(id, 2), vb2 ? (unsigned)vb2[0] : 0u, vb2 ? (unsigned)vb2[6] : 0u);
+        }
+    }
+#endif
     struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
     f.version = NVRM_FLIP_ABI_VERSION; f.kapiMemory = kmem; f.allocationCookie = vm->fAllocationCookie; f.width = (unsigned)W; f.height = (unsigned)H; f.pitch = (unsigned)P;
     if (gIopAsync && pipe) return nvAccelIopAsyncStart(pipe, fb, head, s, &f);
@@ -1456,15 +1827,18 @@ static void nvAccelIopHome(IOService *fb, unsigned head)
     if (rr != kIOReturnSuccess && gIopFlipLogs < 8) { gIopFlipLogs++; ALOG("iop: HOME flip refused (0x%x) head %u", (unsigned)rr, head); }
     gIopFlipped[head] = false;
 }
-static void nvAccelSurfScanoutSync(IOSurface *s)
+// True when the surface's system memory holds its newest pixels (it was never marked dirty in VRAM, or the copy back
+// just ran); false when VRAM is newer and could not be copied back, so the system memory is stale (black on a surface
+// that was only ever drawn by the GPU).
+static bool nvAccelSurfScanoutSync(IOSurface *s)
 {
-    if (!s || !NVAccel::gAccel || !nvSVPend(_ZNK9IOSurface12getSurfaceIDEv((void *)s), 2)) return;
+    if (!s || !NVAccel::gAccel || !nvSVPend(_ZNK9IOSurface12getSurfaceIDEv((void *)s), 2)) return true;
     NVAccel *a = NVAccel::gAccel;
-    if (!nvFamLock(a, true)) {
+    if (!nvFamLockBounded(a, 12)) {
         if (++gNVSVLockMiss <= 8 || (gNVSVLockMiss & 1023) == 0)
             ALOG("surfvram scanout: accelerator lock busy, surface %u stays pending (misses %u)",
                  _ZNK9IOSurface12getSurfaceIDEv((void *)s), gNVSVLockMiss);
-        return;
+        return false;
     }
     void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
     OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
@@ -1474,6 +1848,7 @@ static void nvAccelSurfScanoutSync(IOSurface *s)
     if (!out) nvSVPend(_ZNK9IOSurface12getSurfaceIDEv((void *)s), 0);
     if (cache) ((OSObject *)cache)->release();
     nvFamUnlock(a);
+    return out;
 }
 
 static unsigned nvVaAllocLogged, nvVaMapLogged;

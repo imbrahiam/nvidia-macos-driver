@@ -33,11 +33,21 @@ public:
     ~NVRMCallReference() { owner->release(); }
 };
 class NVRMDisplayGate {
+    IORecursiveLock *lock; bool held = false;
+public:
+    NVRMDisplayGate() : lock(startLock()) { if (lock) { IORecursiveLockLock(lock); held = true; } }
+    ~NVRMDisplayGate() { if (lock && held) IORecursiveLockUnlock(lock); }
+    bool valid() const { return lock != nullptr; }
+    // flipToMemory only, while its flip waits for vblank (it is the gate's only holder there)
+    void drop() { if (lock && held) { IORecursiveLockUnlock(lock); held = false; } }
+    void take() { if (lock && !held) { IORecursiveLockLock(lock); held = true; } }
+};
+// One head's commits in order: taken before the display gate (never after it), by every path that commits on the head.
+class NVRMHeadGate {
     IORecursiveLock *lock;
 public:
-    NVRMDisplayGate() : lock(startLock()) { if (lock) IORecursiveLockLock(lock); }
-    ~NVRMDisplayGate() { if (lock) IORecursiveLockUnlock(lock); }
-    bool valid() const { return lock != nullptr; }
+    explicit NVRMHeadGate(IORecursiveLock *l) : lock(l) { if (lock) IORecursiveLockLock(lock); }
+    ~NVRMHeadGate() { if (lock) IORecursiveLockUnlock(lock); }
 };
 static NVRMAllocationTable<struct NvKmsKapiMemory, 4096> gAllocations;
 extern "C" {
@@ -141,8 +151,18 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     static inline volatile SInt32 sFlipLatched[8] = {};
     bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0);
     bool fSubmissionSeen = false, fSubmissionFaulted = false;
+    // The primary surface of the last tracked commit, and whether that commit was a plain flip (no mode, activity or
+    // display change): a fault on a plain flip clears once NVKMS reports it latched (recoverSubmission).
+    struct NvKmsKapiSurface *fInFlightSurf = nullptr; bool fInFlightFlip = false;
+    unsigned fFaults = 0, fFaultRecoveries = 0, fRejected = 0;
+    // A flip used to hold the display gate (one lock for every head) until it latched, up to a frame: two 240 Hz heads
+    // spent most of each frame waiting on each other, and the cursor on both. Now a flip waits under its head's lock only.
+    IORecursiveLock *fHeadLock = nullptr;
+    bool waitFlipLatched(unsigned ms);
+    bool recoverSubmission();
+    void presentationFault(const char *which, bool plainFlip);
     NvBool submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg, struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit,
-                        bool bootstrap = false, bool cursorOnly = false);
+                        bool bootstrap = false, bool cursorOnly = false, bool latchLater = false);
     thread_call_t fReflip = nullptr;
     unsigned fReflips = 0; int fReflipRc = -99;
     unsigned fVblReg = 0;
@@ -852,11 +872,49 @@ static IORecursiveLock *startLock()
     }
     return gL;
 }
+// Waits for NVKMS to report this head's last primary flip latched; false when it did not within ms. The deadline is time,
+// not iterations: 100 x IOSleep(1) was 100-200 ms, under three frames at 24 Hz and short of a DP retrain after a refresh
+// change, and one miss blocked every later frame and mode change on the head until a restart (black screen, cursor only).
+bool NVRMNVDAFramebuffer::waitFlipLatched(unsigned ms)
+{
+    uint64_t deadline = 0; clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+    for (;;) {
+        NvBool pending = NV_TRUE;
+        if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) return false;
+        if (!pending) return true;
+        if (mach_absolute_time() >= deadline) return false;
+        IOSleep(1);
+    }
+}
+// A plain flip that missed its deadline but has latched since is on the panel now and the surface before it is not, so
+// presentation resumes with that surface as the front (the flip cache never evicts the front). A late mode change stays
+// faulted: its surfaces and mode are not the ones this framebuffer records.
+bool NVRMNVDAFramebuffer::recoverSubmission()
+{
+    if (!fSubmissionFaulted) return true;
+    if (!fInFlightFlip || !fInFlightSurf || !fKms || !fDev) return false;
+    NvBool pending = NV_TRUE;
+    if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending) || pending) return false;
+    fFrontSurf = fInFlightSurf; fSubmissionSeen = false; fSubmissionFaulted = false; fFaultRecoveries++;
+    setProperty("NVRMPresentationRecoveries", (unsigned long long)fFaultRecoveries, 32);
+    FBLOG("presentation resumed on head %u: the late flip latched (fault %u, recovery %u)", fHead, fFaults, fFaultRecoveries);
+    return true;
+}
+// Keep both the old front and submitted surface alive until the flip is seen latched (a plain flip) or a restart.
+void NVRMNVDAFramebuffer::presentationFault(const char *which, bool plainFlip)
+{
+    fSubmissionFaulted = true; fFaults++;
+    setProperty("NVRMPresentationFaults", (unsigned long long)fFaults, 32);
+    FBLOG("presentation blocked: %s completion unavailable on head %u (fault %u, %s)", which, fHead, fFaults,
+          plainFlip ? "resumes when it latches" : "after a mode change: stays until restart");
+}
+// latchLater: the caller waits for the latch itself (flipToMemory, outside the display gate).
 NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg,
                                             struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit, bool bootstrap,
-                                            bool cursorOnly)
+                                            bool cursorOnly, bool latchLater)
 {
-    if (!fKms || !fDev || !cfg || !rep || fHead >= 8 || fSubmissionFaulted) return NV_FALSE;
+    if (!fKms || !fDev || !cfg || !rep || fHead >= 8) return NV_FALSE;
+    if (fSubmissionFaulted && !recoverSubmission()) return NV_FALSE;
     if (!commit) return fKms->applyModeSetConfig(fDev, cfg, rep, NV_FALSE);
     // A cursor-only request leaves the primary layer alone: KAPI does not advance the primary layer's completion slot
     // for it, so there is no primary flip to wait for and the primary tracking below stays as the last present left it.
@@ -867,20 +925,11 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
     if (fSubmissionSeen) {
         // Initial console acceptance is asynchronous. A still-pending prior flip
         // must receive the same bounded completion wait as a newly committed flip.
-        bool complete = false;
-        for (unsigned i = 0; i < 100; ++i) {
-            NvBool pending = NV_TRUE;
-            if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) break;
-            if (!pending) { complete = true; break; }
-            IOSleep(1);
-        }
-        if (!complete) {
-            FBLOG("presentation blocked: prior completion unavailable on head %u", fHead);
-            fSubmissionFaulted = true; return NV_FALSE;
-        }
+        if (!waitFlipLatched(fInFlightFlip ? 500 : 1500)) { presentationFault("prior", fInFlightFlip); return NV_FALSE; }
     }
-    const bool tracked = cfg->headRequestedConfig[fHead].modeSetConfig.bActive &&
-        cfg->headRequestedConfig[fHead].layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX].config.surface;
+    const struct NvKmsKapiHeadRequestedConfig *hrq = &cfg->headRequestedConfig[fHead];
+    const bool tracked = hrq->modeSetConfig.bActive && hrq->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX].config.surface;
+    const bool plainFlip = !hrq->flags.modeChanged && !hrq->flags.activeChanged && !hrq->flags.displaysChanged;
     const NvBool accepted = fKms->applyModeSetConfig(fDev, cfg, rep, NV_TRUE);
     if (!accepted || rep->flipResult != NV_KMS_FLIP_RESULT_SUCCESS) {
         // A rejected request queued nothing (INVALID_PARAMS fails validation, IN_PROGRESS refuses before queuing), so
@@ -891,23 +940,27 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
         // forever. The previous flip was already proven complete above (or nothing was tracked), so forget it here;
         // the next accepted flip gets a fresh slot that NVKMS does write.
         fSubmissionSeen = false;
-        static unsigned rejected;
-        if (++rejected <= 8) FBLOG("commit rejected on head %u result %d (this request only)", fHead, (int)rep->flipResult);
+        // Per head, the first 8 then every 64th: one global cap of 8 was spent at login and later rejections (after a
+        // refresh change on either head) left no trace.
+        if (++fRejected <= 8 || (fRejected % 64) == 0)
+            FBLOG("commit rejected on head %u result %d (#%u, this request only) | mode/act/dpy chg %u%u%u primary surf %u %ux%u -> %ux%u",
+                  fHead, (int)rep->flipResult, fRejected, (unsigned)hrq->flags.modeChanged, (unsigned)hrq->flags.activeChanged,
+                  (unsigned)hrq->flags.displaysChanged, hrq->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX].config.surface ? 1u : 0u,
+                  (unsigned)hrq->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX].config.srcWidth,
+                  (unsigned)hrq->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX].config.srcHeight,
+                  (unsigned)hrq->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX].config.dstWidth,
+                  (unsigned)hrq->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX].config.dstHeight);
+        setProperty("NVRMRejectedCommits", (unsigned long long)fRejected, 32);
         return NV_FALSE;
     }
     if (!tracked) { fSubmissionSeen = false; return NV_TRUE; }
     fSubmissionSeen = true;
+    fInFlightSurf = hrq->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX].config.surface; fInFlightFlip = plainFlip;
     // Initial acceptance permits console handoff, never surface retirement. The owned boot surface remains pinned.
-    if (bootstrap) return NV_TRUE;
-    for (unsigned i = 0; i < 100; ++i) {
-        NvBool pending = NV_TRUE;
-        if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) break;
-        if (!pending) return NV_TRUE;
-        IOSleep(1);
-    }
-    // Keep both the old front and submitted surface alive until a proven recovery/reboot.
-    FBLOG("presentation blocked: submitted completion unavailable on head %u", fHead);
-    fSubmissionFaulted = true; return NV_FALSE;
+    if (bootstrap || latchLater) return NV_TRUE;
+    if (waitFlipLatched(plainFlip ? 500 : 1500)) return NV_TRUE;
+    presentationFault("submitted", plainFlip);
+    return NV_FALSE;
 }
 
 void NVRMNVDAFramebuffer::sampleFire(thread_call_param_t p0, thread_call_param_t)
@@ -940,7 +993,7 @@ void NVRMNVDAFramebuffer::sampleFire(thread_call_param_t p0, thread_call_param_t
 }
 bool NVRMNVDAFramebuffer::reflip()
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMHeadGate head(fHeadLock); NVRMDisplayGate gate; if (!gate.valid()) return false;
     if (!fKms || !fDev || !fSurf) return false;
     struct NvKmsKapiSurface *front = fFrontSurf ? fFrontSurf : fSurf;
     struct NvKmsKapiRequestedModeSetConfig *cfg =
@@ -1063,7 +1116,7 @@ bool NVRMNVDAFramebuffer::cursorInit()
 }
 bool NVRMNVDAFramebuffer::cursorApply()
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMHeadGate head(fHeadLock); NVRMDisplayGate gate; if (!gate.valid()) return false;
     if (!fKms || !fDev || !fCurSurf || !fModeSet) return false;
     struct NvKmsKapiRequestedModeSetConfig *cfg =
         (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
@@ -1253,7 +1306,7 @@ void NVRMNVDAFramebuffer::vblFire(thread_call_param_t p0, thread_call_param_t)
 }
 bool NVRMNVDAFramebuffer::setHeadActive(bool active)
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMHeadGate head(fHeadLock); NVRMDisplayGate gate; if (!gate.valid()) return false;
     if (!fKms || !fDev) return false;
     struct NvKmsKapiRequestedModeSetConfig *cfg = (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
     struct NvKmsKapiModeSetReplyConfig *rep = (struct NvKmsKapiModeSetReplyConfig *)IOMalloc(sizeof *rep);
@@ -1303,7 +1356,7 @@ void NVRMNVDAFramebuffer::headProbeFire(thread_call_param_t p0, thread_call_para
 }
 bool NVRMNVDAFramebuffer::applyMode()
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMHeadGate head(fHeadLock); NVRMDisplayGate gate; if (!gate.valid()) return false;
     if (fConsoleAperture) {
         FBLOG("applyMode: skipped (console aperture mode -- the GOP drives this panel)");
         fModeSet = true; return true;
@@ -1372,6 +1425,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     }
     fFlipCacheLock = IOSimpleLockAlloc();
     if (!fFlipCacheLock) return false;
+    fHeadLock = IORecursiveLockAlloc();   // NULL keeps the old shape: the flip waits for its latch under the display gate
     fKms = (struct NvKmsKapiFunctionsTable *)(uintptr_t)propU64(provider, "nvkms-kapi");
     fGpuId = (NvU32)propU64(provider, "gpu-id");
     fIndex = (unsigned)propU64(provider, "fb-index");
@@ -1473,6 +1527,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
 void NVRMNVDAFramebuffer::free()
 {
     if (fFlipCacheLock) { IOSimpleLockFree(fFlipCacheLock); fFlipCacheLock = nullptr; }
+    if (fHeadLock) { IORecursiveLockFree(fHeadLock); fHeadLock = nullptr; }
     super::free();
 }
 
@@ -1601,8 +1656,8 @@ int NVRMNVDAFramebuffer::dtIndex(IODisplayModeID id) const
 }
 IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsKapiDisplayMode &m, NvU32 w, NvU32 h)
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return kIOReturnNoMemory;
-    if (fSubmissionFaulted) return kIOReturnNotReady;
+    NVRMHeadGate head(fHeadLock); NVRMDisplayGate gate; if (!gate.valid()) return kIOReturnNoMemory;
+    if (!recoverSubmission()) return kIOReturnNotReady;
     if (!fKms || !fDev || !fMem || fConsoleAperture) return kIOReturnNotReady;
     NvU32 pitch = 0;
     if (!nvrmCheckedPitch(w, fPitchAlign, &pitch)) return kIOReturnBadArgument;
@@ -1961,6 +2016,19 @@ SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_max_us, CTLFLAG_RD | CTLFLAG_LOCK
 static int gFlipLean = 1;
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_lean, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipLean, 0, "1 = lean pure flip (surface only)");
 static SInt64 gFlipUsSum, gFlipN, gFlipUsMax;
+// A pure flip takes about one frame; anything far above that is a visible stall (resizes stutter, the mouse
+// hitches). The counter alone says "it happened", never when -- and one 679 ms outlier was measured with nothing
+// to correlate it against. This logs the slow ones only: one load and one compare in the normal path.
+static int  gFlipSlowUs = 50000;
+static int  gFlipSlow = 0, gFlipSlowLogged = 0;
+// How long a flip spent waiting for THIS head's lock and the display gate before it even built its config. It was
+// never measured: a slow flip was one number, and a stuck 160 ms one (NVKMS-private) could not be told from a flip
+// that queued behind another head's modeset. gate / submit / latch now sum to the total.
+static int  gFlipGateUsMax = 0, gFlipGateWaits = 0;
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_gate_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipGateUsMax, 0, "longest wait for the head lock + display gate at the top of flipToMemory (us)");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_gate_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipGateWaits, 0, "flips that waited longer than 5 ms for the head lock or display gate");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_slow_us, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipSlowUs, 0, "log every pure flip slower than this (0 = only the counter)");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_slow, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipSlow, 0, "pure flips slower than nvrmfb_flip_slow_us");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_interval, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipInterval, 0, "minPresentInterval of the pure (zero-copy) flip; tearing stays off");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_us_sum, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFlipUsSum, "microseconds spent in pure-flip applyModeSetConfig");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_n, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFlipN, "pure flips timed");
@@ -1975,6 +2043,8 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest); sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest_mode);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_interval); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_sum);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_n); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_max);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_flip_slow); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_slow_us);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_flip_gate_max_us); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_gate_waits);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_lean);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_waits);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_timeouts); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_max_us);
@@ -2157,7 +2227,11 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
 bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h,
                                    unsigned pitch, int *rcOut, bool pure, UInt64 cookie)
 {
-    NVRMDisplayGate gate; if (!gate.valid() || fSubmissionFaulted) return false;
+    const uint64_t tEntry = mach_absolute_time();
+    NVRMHeadGate head(fHeadLock); NVRMDisplayGate gate; if (!gate.valid() || !recoverSubmission()) return false;
+    { const SInt64 gus = (SInt64)((mach_absolute_time() - tEntry) / 1000);
+      if (gus > gFlipGateUsMax) gFlipGateUsMax = (int)gus;
+      if (gus > 5000) OSIncrementAtomic(&gFlipGateWaits); }
     if (mem) {
         const UInt64 bytes = gAllocations.size(mem, cookie);
         if (!bytes || !w || !h || w > 65535 || h > 65535 || (UInt64)w * 4 > pitch || (UInt64)pitch * h > bytes) return false;
@@ -2237,13 +2311,27 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
     if (!lean)
         lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
     const uint64_t ft0 = mach_absolute_time();
-    NvBool ok = submitConfig(cfg, rep, NV_TRUE);
-    if (pure) { const SInt64 us = (SInt64)((mach_absolute_time() - ft0) / 1000);
-        OSAddAtomic64(us, &gFlipUsSum); OSAddAtomic64(1, &gFlipN); if (us > gFlipUsMax) gFlipUsMax = us; }
+    NvBool ok = submitConfig(cfg, rep, NV_TRUE, false, false, fHeadLock != nullptr);
+    const uint64_t tPostSubmit = mach_absolute_time();
     int rc = ok ? (int)rep->flipResult : -1;
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
+    bool accepted = ok && rc == NV_KMS_FLIP_RESULT_SUCCESS;
+    if (accepted && fHeadLock) {
+        // Other heads flip and every cursor moves while this one waits for its vblank; this head's own commits wait
+        // on fHeadLock, so the latch seen here is this flip's.
+        gate.drop(); const bool latched = waitFlipLatched(pure ? 500 : 1500); gate.take();
+        if (!latched) { presentationFault("submitted", pure); accepted = false; rc = -1; }
+    }
+    if (pure) { const SInt64 us = (SInt64)((mach_absolute_time() - ft0) / 1000);
+        OSAddAtomic64(us, &gFlipUsSum); OSAddAtomic64(1, &gFlipN); if (us > gFlipUsMax) gFlipUsMax = us;
+        if (us > gFlipSlowUs) { OSIncrementAtomic(&gFlipSlow);
+            if (gFlipSlowUs > 0 && gFlipSlowLogged < 128)
+                { gFlipSlowLogged++;
+                  const SInt64 submitUs = (SInt64)((tPostSubmit - ft0) / 1000);
+                  const SInt64 preUs    = (SInt64)((ft0 - tEntry) / 1000);   // head lock + display gate + cache/config build
+                  FBLOG("SLOW flip #%u: %lld us = pre %lld (gate max %d) + submit %lld + latch %lld (max %lld, %lld flips)",
+                        fFlipCount, (long long)us, (long long)preUs, gFlipGateUsMax, (long long)submitUs, (long long)(us - submitUs), (long long)gFlipUsMax, (long long)gFlipN); } } }
     if (rcOut) *rcOut = rc;
-    const bool accepted = ok && rc == NV_KMS_FLIP_RESULT_SUCCESS;
     if (accepted) fFrontSurf = surf;
     fFlipCount++;
     if (fFlipCount <= 8 || (fFlipCount % 600) == 0)

@@ -591,7 +591,16 @@ SIPON=0; csrutil status 2>/dev/null | grep -q 'status: enabled\.' && SIPON=1
 step "Checking the OpenCore settings"
 EDITS=(); ADDED=""; REMOVED=""
 args=$(get NVRAM.Add.$B.boot-args); new=""
-for a in $args; do case " $DROP_ARGS " in *" $a "*) echo "CHANGE boot-args: remove $a (it hides the NVIDIA card)"; REMOVED="$REMOVED $a";; *) new="$new $a";; esac; done
+for a in $args; do
+  case "$a" in
+    nvfb=*|nvaccel=*|nvfbheads=*)
+      case " $WANT_ARGS " in
+        *" $a "*) ;;
+        *) echo "CHANGE boot-args: remove $a (replaced by the driver setting)"; REMOVED="$REMOVED $a"; continue;;
+      esac;;
+  esac
+  case " $DROP_ARGS " in *" $a "*) echo "CHANGE boot-args: remove $a (it hides the NVIDIA card)"; REMOVED="$REMOVED $a";; *) new="$new $a";; esac
+done
 for a in $WANT_ARGS; do case " $new " in *" $a "*) ;; *) new="$new $a"; ADDED="$ADDED $a"; echo "CHANGE boot-args: add $a";; esac; done
 new=${new# }
 [ "$new" != "$args" ] && EDITS+=("NVRAM.Add.$B.boot-args|-string|$new")
